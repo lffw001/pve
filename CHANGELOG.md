@@ -1,5 +1,67 @@
 # 更新日志
 
+2026.08.25
+
+- IPv6 NAT 只使用宿主机本地绑定的公网地址；启用转发时保留上联网卡的 RA 默认路由，避免错误前缀或 SLAAC 路由丢失
+
+2026.08.23
+
+- 修复 `ssh_sh.sh` 在 POSIX `/bin/sh` 下使用 Bash 专有比较运算符导致 Alpine、OpenWrt 和 Arch 分支识别异常的问题；补充 x86 镜像数组选择的边界处理
+- 扩展 shell 回归工作流覆盖仓库内全部 `.sh`/`.service` 变更，并新增 ifupdown2 安装生命周期、默认 VM 镜像选择和 POSIX shell 识别的隔离测试
+
+2026.08.22
+
+- 修复 oneclickvirt 远程集成测试在 `ifupdown2-install.service` 二次重启期间过早启动 PVE 第二阶段的问题；测试现在等待引导服务完成并确认 SSH 稳定
+- 修复安装网络回归测试在新版 ShellCheck 下因间接模拟函数重定义触发 `SC2317` 的问题
+
+2026.06.30
+
+- 安装脚本新增 PVE 主桥接网口确认步骤，显示候选网口、IPv4、网关和 MAC，可输入序号选择，直接回车仍沿用原自动检测逻辑
+- 支持 `PVE_MAIN_INTERFACE=<iface>` 在无交互安装中预设主桥接网口，并在选择后同步持久化对应 IPv4、网关、子网和 MAC 缓存
+- 修复多网卡云主机重启后静态网口掩码退化及 ifupdown2 首次安装热重载导致远程断网的问题；桥接配置保留原始 CIDR，并在核心包安装期间使用 Proxmox 安装模式保护网络
+- 新增安装网络与 Proxmox 安装模式的回归测试，覆盖前缀漂移、重复地址、DHCP 保留、幂等写入及成功/失败清理
+
+2026.06.04
+
+- 修复删除脚本仅登记带 IPv4 配置的 VM/CT，导致无 `ip=` 配置、仅 IPv6 或 cloud-init 缺失 IP 的实例无法通过 ID/all 删除的问题
+- 收紧删除脚本按 IPv4 清理 NAT 规则时的匹配方式，提取首个合法 IPv4 并使用边界匹配清理 nftables/iptables 规则，避免误删相近地址
+- 无线配置脚本支持 `WIFI_INTERFACE` 环境变量优先指定接口，补充 `wlan*`、`wlx*`、`wl*` 等常见无线接口自动识别，并校验接口名
+- 修复 Debian 13/Trixie x86 PVE 源组件名，默认使用 `pve-no-subscription` 而不是测试仓库组件，并在初始化时重写脚本管理的 Trixie 源文件
+- 加固 PVE GPG key 下载逻辑，避免下载失败后留下空 key 文件仍被当作可用 key
+- 加固安装脚本空值/非法 IPv4 判断和 cloud-init alias 清理的缺省文件处理
+- 加固 NAT 网络初始化，避免重复执行脚本时重复追加同一条基础 masquerade 规则
+- 修复卸载脚本尾段仍依赖 `sudo` 与空 rc 包列表时可能触发无效 `dpkg --purge` 的问题
+
+2026.06.03
+
+- 加固 GitHub Actions：升级 action 版本，启用 `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24`，补充最小写权限、并发取消和 job 超时设置
+- 收紧下载脚本和 systemd unit 权限，移除全局可写 `chmod 777`
+- 统一安装阶段脚本与 systemd unit 权限：可执行脚本使用 `755`，unit 文件使用 `644`
+- 修复 HE 隧道转换脚本下载到 `/root/covert.sh` 后仍从当前目录执行的路径不一致问题
+- Dockerfile 默认锁定 root 密码，构建脚本显式开启 BuildKit，并通过 secret 接收 `ROOT_PASSWORD` 或 `PVE_DOCKER_ROOT_PASSWORD`
+- 底层 VM/CT 构建脚本未传入密码时改为生成随机密码，批量创建流程也不再使用基于时间的短密码
+- 底层 VM/CT/macOS VM 构建脚本新增 storage 名称白名单校验，避免命令参数被拆分或污染上下文
+- VM 镜像卷查询统一引用 storage 参数，配合白名单校验避免参数拆分
+- 创建 VM/CT 入口优先复用同仓库本地构建脚本，缺失时才回退远端下载
+- 创建 VM/CT 入口调用底层构建脚本时保留参数边界，避免异常输入被 shell 拆分
+- 修复 Windows LocalScripts metadata 路径转义警告，并修正 DHCP/admin metadata 缺失时的容错处理
+- 修复 shellcheck error 级别问题：颜色输出函数参数、数组展开、glob 判断和重复重定向
+- 删除脚本新增存储卷索引，批量删除 VM/CT 时避免按 ID 重复扫描所有存储
+- 创建 VM/CT 入口移除不必要的 `eval`，避免 home 目录解析执行拼接字符串
+- 新增仓库级 `.gitignore`，排除本地密钥、数据库、截图、缓存和构建产物
+- 同步 README 中英文快速开始、无交互模式和 Docker 构建说明
+
+2026.05.11
+
+- 优化并使用组织自维护的[ndpresponder](https://github.com/oneclickvirt/ndpresponder)项目，解决组播和单播的时候的活跃过期问题
+- 修复V6切分可能导致子网掩码超过协议设置要求的问题
+
+2026.05.03
+
+- 修复可能存在链未加载就去进行NAT映射导致映射失效
+- 修复免费的IPV6分配时不进行禁止公网Ping操作可能导致的数据库地理未知变更的问题
+- 优化macos序列号生成为自动生成，原序列号仅作兜底补充
+
 2026.04.13
 
 - 修改为默认nft优先，不可用时才自动降级ipt

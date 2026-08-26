@@ -1,20 +1,39 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/pve
-# 2026.02.28
+# 2026.08.26
 # ./buildct_onlyv6.sh CTID 密码 CPU核数 内存 硬盘 系统 存储盘
 # ./buildct_onlyv6.sh 102 1234567 1 512 5 debian11 local
 
 cd /root >/dev/null 2>&1
 
+generate_password() {
+    local value
+    value=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)
+    if [ -z "$value" ]; then
+        value="$(date +%s%N | md5sum | cut -c 3-14)"
+    fi
+    printf '%s' "$value"
+}
+
+validate_storage_name() {
+    local value="$1"
+    if [[ -z "$value" || ! "$value" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        echo "Invalid storage name: $value"
+        echo "存储盘名称无效：$value"
+        exit 1
+    fi
+}
+
 init() {
     CTID="${1:-102}"
-    password="${2:-123456}"
+    password="${2:-$(generate_password)}"
     core="${3:-1}"
     memory="${4:-512}"
     disk="${5:-5}"
     system_ori="${6:-debian11}"
     storage="${7:-local}"
+    validate_storage_name "$storage"
     rm -rf "ct$CTID"
     en_system=$(echo "$system_ori" | sed 's/[0-9]*//g; s/\.$//')
     num_system=$(echo "$system_ori" | sed 's/[a-zA-Z]*//g')
@@ -23,25 +42,19 @@ init() {
 
 check_requirements() {
     appended_file="/usr/local/bin/pve_appended_content.txt"
-    if [ ! -s "$appended_file" ]; then
-        if [ ! -f /usr/local/bin/pve_check_ipv6 ]; then
-            _yellow "No ipv6 address exists to open a server with a standalone IPV6 address"
-        fi
-        if ! grep -q "vmbr2" /etc/network/interfaces; then
-            _yellow "No vmbr2 exists to open a server with a standalone IPV6 address"
-        fi
-        service_status=$(systemctl is-active ndpresponder.service)
-        if [ "$service_status" == "active" ]; then
-            _green "The ndpresponder service started successfully and is running, and the host can open a service with a separate IPV6 address."
-            _green "ndpresponder服务启动成功且正在运行，宿主机可开设带独立IPV6地址的服务。"
-        else
-            _green "The status of the ndpresponder service is abnormal and the host may not open a service with a separate IPV6 address."
-            _green "ndpresponder服务状态异常，宿主机不可开设带独立IPV6地址的服务。"
+    if [ -s "$appended_file" ]; then
+        _green "Additional IPv6 addresses exist for mapping by NAT, and the host can open services with separate IPV6 addresses."
+        _green "存在额外的IPv6地址可供映射，宿主机可开设带独立IPV6地址的服务。"
+    elif [ "${pve_direct_ipv6_available:-false}" = true ]; then
+        if pve_direct_ipv6_ndp_required && [ "$(systemctl is-active ndpresponder.service 2>/dev/null || true)" != active ]; then
+            _red "ndpresponder is required for this IPv6 prefix but is not active"
+            _red "当前 IPv6 前缀需要 ndpresponder，但服务未运行"
             exit 1
         fi
-    elif [ -s "$appended_file" ]; then
-        _green "Additional IPv6 addresses exist for mapping by NAT, and the host can open services with separate IPV6 addresses."
-        _green "存在额外的IPv6地址可供NAT进行映射，宿主机可开设带独立IPV6地址的服务。"
+    else
+        _red "No delegated public IPv6 prefix is available for an IPv6-only container"
+        _red "未检测到可用于纯 IPv6 容器的已委派公网前缀"
+        exit 1
     fi
 }
 
@@ -62,13 +75,16 @@ check_cdn_file() {
     if [ "${WITHOUTCDN^^}" = "TRUE" ]; then
         export cdn_success_url=""
         echo "WITHOUTCDN=TRUE, skip CDN acceleration"
+        echo "WITHOUTCDN=TRUE，跳过 CDN 加速"
         return
     fi
     check_cdn "https://raw.githubusercontent.com/spiritLHLS/ecs/main/back/test"
     if [ -n "$cdn_success_url" ]; then
         echo "CDN available, using CDN"
+        echo "检测到可用 CDN，使用 CDN 加速"
     else
         echo "No CDN available, no use CDN"
+        echo "未检测到可用 CDN，不使用 CDN 加速"
     fi
 }
 
@@ -119,7 +135,7 @@ get_ipv6_info() {
 
 setup_mirrors_for_cn() {
     pct exec $CTID -- curl -lk https://gitee.com/SuperManito/LinuxMirrors/raw/main/ChangeMirrors.sh -o ChangeMirrors.sh
-    pct exec $CTID -- chmod 777 ChangeMirrors.sh
+    pct exec $CTID -- chmod 755 ChangeMirrors.sh
     pct exec $CTID -- ./ChangeMirrors.sh --source mirrors.tuna.tsinghua.edu.cn --web-protocol http --intranet false --close-firewall true --backup true --updata-software false --clean-cache false --ignore-backup-tips > /dev/null
     pct exec $CTID -- rm -rf ChangeMirrors.sh
 }
@@ -135,6 +151,7 @@ setup_container_os() {
         public_network_check_res=$(pct exec $CTID -- curl -lk -m 6 ${cdn_success_url}https://raw.githubusercontent.com/spiritLHLS/ecs/main/back/test)
         if [[ $public_network_check_res == *"success"* ]]; then
             echo "network is public"
+            echo "网络连通正常"
         else
             echo "nameserver 8.8.8.8" | pct exec $CTID -- tee -a /etc/resolv.conf
             sleep 1
@@ -144,6 +161,7 @@ setup_container_os() {
         ssh_check_res=$(pct exec $CTID -- lsof -i:22)
         if [[ $ssh_check_res == *"ssh"* ]]; then
             echo "ssh config correct"
+            echo "SSH 配置正常"
         else
             pct exec $CTID -- service ssh restart
             pct exec $CTID -- service sshd restart
@@ -184,7 +202,7 @@ setup_container_os() {
                 sleep 1
             else
                 pct exec $CTID -- wget https://gitee.com/SuperManito/LinuxMirrors/raw/main/ChangeMirrors.sh
-                pct exec $CTID -- chmod 777 ChangeMirrors.sh
+                pct exec $CTID -- chmod 755 ChangeMirrors.sh
                 pct exec $CTID -- ./ChangeMirrors.sh --source mirrors.tuna.tsinghua.edu.cn --web-protocol http --intranet false --close-firewall true --backup true --updata-software false --clean-cache false --ignore-backup-tips > /dev/null
                 pct exec $CTID -- rm -rf ChangeMirrors.sh
             fi
@@ -202,12 +220,12 @@ setup_container_os() {
         fi
         if echo "$system" | grep -qiE "alpine|archlinux|gentoo|openwrt" >/dev/null 2>&1; then
             pct exec $CTID -- curl -L ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/pve/main/scripts/ssh_sh.sh -o ssh_sh.sh
-            pct exec $CTID -- chmod 777 ssh_sh.sh
+            pct exec $CTID -- chmod 755 ssh_sh.sh
             pct exec $CTID -- dos2unix ssh_sh.sh
             pct exec $CTID -- bash ssh_sh.sh
         else
             pct exec $CTID -- curl -L ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/pve/main/scripts/ssh_bash.sh -o ssh_bash.sh
-            pct exec $CTID -- chmod 777 ssh_bash.sh
+            pct exec $CTID -- chmod 755 ssh_bash.sh
             pct exec $CTID -- dos2unix ssh_bash.sh
             pct exec $CTID -- bash ssh_bash.sh
         fi
@@ -215,21 +233,49 @@ setup_container_os() {
 }
 
 create_container() {
-    user_ip="172.16.1.${CTID}"
+    local ct_conf="/etc/pve/lxc/${CTID}.conf"
+    local retry=0
+    local max_retry=7
+    local wait_interval=3
+    user_ip="${pve_nat_prefix}.${CTID}"
     if [ "$fixed_system" = true ]; then
         pct create $CTID /var/lib/vz/template/cache/${system_name} -cores $core -cpuunits 1024 -memory $memory -swap 128 -rootfs ${storage}:${disk} -onboot 1 -password $password -features nesting=1
     else
         pct create $CTID ${storage}:vztmpl/${system_name} -cores $core -cpuunits 1024 -memory $memory -swap 128 -rootfs ${storage}:${disk} -onboot 1 -password $password -features nesting=1
     fi
+    if [ $? -ne 0 ]; then
+        echo -e "\e[31mpct create failed for CT ${CTID}, container will not be started\e[0m"
+        echo -e "\e[31mCT ${CTID} 创建失败，已停止后续启动流程\e[0m"
+        exit 1
+    fi
+    while [ $retry -lt $max_retry ]; do
+        if [ -f "$ct_conf" ]; then
+            break
+        fi
+        sleep $wait_interval
+        retry=$((retry + 1))
+    done
+    if [ ! -f "$ct_conf" ]; then
+        echo -e "\e[31mLXC config not found after create: $ct_conf\e[0m"
+        echo -e "\e[31m创建后未检测到 LXC 配置文件：$ct_conf\e[0m"
+        echo -e "\e[31mPlease check pve-cluster status and /etc/pve mount state\e[0m"
+        echo -e "\e[31m请检查 pve-cluster 状态和 /etc/pve 挂载状态\e[0m"
+        exit 1
+    fi
     pct start $CTID
+    if [ $? -ne 0 ]; then
+        echo -e "\e[31mpct start failed for CT ${CTID}\e[0m"
+        echo -e "\e[31mCT ${CTID} 启动失败\e[0m"
+        exit 1
+    fi
     sleep 5
     pct set $CTID --hostname $CTID
     appended_file="/usr/local/bin/pve_appended_content.txt"
     if [ -s "$appended_file" ]; then
         # 使用 vmbr1 网桥和 NAT 映射
-        ct_internal_ipv6="2001:db8:1::${CTID}"
-        pct set $CTID --net0 name=eth0,ip6="${ct_internal_ipv6}/64",bridge=vmbr1,gw6="2001:db8:1::1"
-        pct set $CTID --net1 name=eth1,ip=${user_ip}/24,bridge=vmbr1,gw=172.16.1.1
+        ct_internal_ipv6="$(pve_nat_ipv6_for_id "$CTID")"
+        pct set $CTID --net0 name=eth0,ip6="${ct_internal_ipv6}/64",bridge=vmbr1,gw6="${pve_nat_ipv6_gateway}"
+        pct set $CTID --net1 name=eth1,ip=${user_ip}/24,bridge=vmbr1,gw=${pve_nat_gateway}
         pct set $CTID --nameserver "8.8.8.8 8.8.4.4 2001:4860:4860::8888 2001:4860:4860::8844"
         # 获取可用的外部 IPv6 地址
         host_external_ipv6=$(get_available_vmbr1_ipv6)
@@ -243,21 +289,26 @@ create_container() {
         ct_external_ipv6="$host_external_ipv6"
         echo "Container configured with NAT mapping: $ct_internal_ipv6 -> $host_external_ipv6"
         echo "容器已配置NAT映射：$ct_internal_ipv6 -> $host_external_ipv6"
-    elif grep -q "vmbr2" /etc/network/interfaces; then
-        # 使用 vmbr2 网桥直接分配IPv6地址
-        pct set $CTID --net0 name=eth0,ip6="${ipv6_address_without_last_segment}${CTID}/128",bridge=vmbr2,gw6="${host_ipv6_address}"
-        pct set $CTID --net1 name=eth1,ip=${user_ip}/24,bridge=vmbr1,gw=172.16.1.1
+    elif [ "${pve_direct_ipv6_available:-false}" = true ]; then
+        # 使用已确认的直连网桥直接分配 IPv6 地址
+        ct_external_ipv6="$(pve_direct_ipv6_for_id "$CTID")" || exit 1
+        direct_ipv6_bridge="$(pve_direct_ipv6_bridge)" || exit 1
+        pct set $CTID --net0 name=eth0,ip6="${ct_external_ipv6}/128",bridge="${direct_ipv6_bridge}",gw6="${pve_direct_ipv6_gateway}"
+        pct set $CTID --net1 name=eth1,ip=${user_ip}/24,bridge=vmbr1,gw=${pve_nat_gateway}
         pct set $CTID --nameserver "8.8.8.8 8.8.4.4 2001:4860:4860::8888 2001:4860:4860::8844"
-        echo "Container configured with vmbr2: ${ipv6_address_without_last_segment}${CTID}"
-        echo "容器已配置使用vmbr2：${ipv6_address_without_last_segment}${CTID}"
-        ct_external_ipv6="${ipv6_address_without_last_segment}${CTID}"
-        _fw6_drop_icmpv6_ping "${ipv6_address_without_last_segment}${CTID}" "${ipv6_prefixlen:+${ipv6_address_without_last_segment}/${ipv6_prefixlen}}"
+        echo "Container configured with ${direct_ipv6_bridge}: ${ct_external_ipv6}"
+        echo "容器已配置使用 ${direct_ipv6_bridge}：${ct_external_ipv6}"
+        _fw6_drop_icmpv6_ping "${ct_external_ipv6}" "${pve_direct_ipv6_prefix}"
         _fw_save
+    else
+        _red "No usable IPv6 allocation mode is available"
+        exit 1
     fi
     sleep 3
 }
 
 save_container_info() {
+    local ct_conf="/etc/pve/lxc/${CTID}.conf"
     echo "$CTID $password $core $memory $disk $system_ori $storage ${ct_external_ipv6}" >>"ct${CTID}"
     data=$(echo " CTID root密码-password CPU核数-CPU 内存-memory 硬盘-disk 系统-system 存储盘-storage 外网IPV6-ipv6")
     values=$(cat "ct${CTID}")
@@ -269,8 +320,13 @@ save_container_info() {
         echo ""
     done >"/tmp/temp${CTID}.txt"
     sed -i 's/^/# /' "/tmp/temp${CTID}.txt"
-    cat "/etc/pve/lxc/${CTID}.conf" >>"/tmp/temp${CTID}.txt"
-    cp "/tmp/temp${CTID}.txt" "/etc/pve/lxc/${CTID}.conf"
+    if [ -f "$ct_conf" ]; then
+        cat "$ct_conf" >>"/tmp/temp${CTID}.txt"
+        cp "/tmp/temp${CTID}.txt" "$ct_conf"
+    else
+        echo -e "\e[33mSkip writing metadata into missing LXC config: $ct_conf\e[0m"
+        echo -e "\e[33m跳过写入不存在的 LXC 配置文件：$ct_conf\e[0m"
+    fi
     rm -rf "/tmp/temp${CTID}.txt"
     cat "ct${CTID}"
 }
@@ -287,6 +343,8 @@ main() {
     cdn_urls=("https://cdn0.spiritlhl.top/" "http://cdn1.spiritlhl.net/" "http://cdn2.spiritlhl.net/" "http://cdn3.spiritlhl.net/" "http://cdn4.spiritlhl.net/")
     check_cdn_file
     load_default_config
+    load_nat_ipv4_config || exit 1
+    pve_load_direct_ipv6_config || exit 1
     set_locale
     check_requirements
     get_system_arch || exit 1

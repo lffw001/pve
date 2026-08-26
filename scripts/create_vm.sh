@@ -5,11 +5,36 @@
 
 # cd /root
 
-_red() { echo -e "\033[31m\033[01m$@\033[0m"; }
-_green() { echo -e "\033[32m\033[01m$@\033[0m"; }
-_yellow() { echo -e "\033[33m\033[01m$@\033[0m"; }
-_blue() { echo -e "\033[36m\033[01m$@\033[0m"; }
-reading() { read -rp "$(_green "$1")" "$2"; }
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
+_red() { echo -e "\033[31m\033[01m$*\033[0m"; }
+_green() { echo -e "\033[32m\033[01m$*\033[0m"; }
+_yellow() { echo -e "\033[33m\033[01m$*\033[0m"; }
+_blue() { echo -e "\033[36m\033[01m$*\033[0m"; }
+is_noninteractive() {
+    case "${noninteractive:-}" in
+    true | TRUE | True | 1 | yes | YES | Yes | y | Y)
+        return 0
+        ;;
+    esac
+    case "${NONINTERACTIVE:-}" in
+    true | TRUE | True | 1 | yes | YES | Yes | y | Y)
+        return 0
+        ;;
+    esac
+    return 1
+}
+reading() {
+    local prompt="$1"
+    local var_name="$2"
+    local default_value="${3:-}"
+    if is_noninteractive; then
+        printf -v "$var_name" '%s' "$default_value"
+        _yellow "noninteractive=true, using default for ${var_name}: ${default_value:-<empty>}"
+    else
+        read -rp "$(_green "$prompt")" "$var_name"
+    fi
+}
 utf8_locale=$(locale -a 2>/dev/null | grep -i -m 1 -E "UTF-8|utf8")
 if [[ -z "$utf8_locale" ]]; then
     echo "No UTF-8 locale found"
@@ -31,7 +56,10 @@ get_system_arch() {
         system_arch="x86"
         ;;
     "armv7l" | "armv8" | "armv8l" | "aarch64")
-        system_arch="arch"
+        system_arch="arm"
+        ;;
+    "riscv64")
+        system_arch="riscv64"
         ;;
     *)
         system_arch=""
@@ -70,7 +98,11 @@ cdn_urls=("https://cdn0.spiritlhl.top/" "http://cdn3.spiritlhl.net/" "http://cdn
 check_cdn_file
 
 pre_check() {
-    home_dir=$(eval echo "~$(whoami)")
+    home_dir=""
+    if command -v getent >/dev/null 2>&1; then
+        home_dir=$(getent passwd "$(id -un)" | cut -d: -f6)
+    fi
+    home_dir="${home_dir:-${HOME:-}}"
     if [ "$home_dir" != "/root" ]; then
         _red "The script will exit if the current path is not /root."
         _red "当前路径不是/root，脚本将退出。"
@@ -80,7 +112,12 @@ pre_check() {
         apt-get install dos2unix -y
     fi
     if [ ! -f "buildvm.sh" ]; then
-        curl -L ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/pve/main/scripts/buildvm.sh -o buildvm.sh && chmod +x buildvm.sh
+        if [ -f "${script_dir}/buildvm.sh" ]; then
+            cp -f "${script_dir}/buildvm.sh" buildvm.sh
+        else
+            curl -L "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/pve/main/scripts/buildvm.sh" -o buildvm.sh
+        fi
+        chmod 755 buildvm.sh
         dos2unix buildvm.sh
     fi
 }
@@ -133,9 +170,13 @@ check_info() {
 build_new_vms() {
     while true; do
         _green "How many more NAT servers need to be generated? (Enter how many new NAT servers to add):"
-        reading "还需要生成几个NAT服务器？(输入新增几个NAT服务器)：" new_nums
+        reading "还需要生成几个NAT服务器？(输入新增几个NAT服务器)：" new_nums "${PVE_CREATE_COUNT:-1}"
         if [[ "$new_nums" =~ ^[1-9][0-9]*$ ]]; then
             break
+        elif is_noninteractive; then
+            _red "PVE_CREATE_COUNT must be a positive integer in noninteractive mode."
+            _red "无交互模式下 PVE_CREATE_COUNT 必须是正整数。"
+            exit 1
         else
             _yellow "Invalid input, please enter a positive integer."
             _yellow "输入无效，请输入一个正整数。"
@@ -143,9 +184,13 @@ build_new_vms() {
     done
     while true; do
         _green "How many CPUs are assigned to each virtual machine? (Enter 1 if 1 core is assigned to each virtual machine):"
-        reading "每个虚拟机分配几个CPU？(若每个虚拟机分配1核，则输入1)：" cpu_nums
+        reading "每个虚拟机分配几个CPU？(若每个虚拟机分配1核，则输入1)：" cpu_nums "${PVE_CREATE_CPU:-1}"
         if [[ "$cpu_nums" =~ ^[1-9][0-9]*$ ]]; then
             break
+        elif is_noninteractive; then
+            _red "PVE_CREATE_CPU must be a positive integer in noninteractive mode."
+            _red "无交互模式下 PVE_CREATE_CPU 必须是正整数。"
+            exit 1
         else
             _yellow "Invalid input, please enter a positive integer."
             _yellow "输入无效，请输入一个正整数。"
@@ -153,9 +198,13 @@ build_new_vms() {
     done
     while true; do
         _green "How much memory is allocated per virtual machine? (If 512 MB of memory is allocated per virtual machine, enter 512):"
-        reading "每个虚拟机分配多少内存？(若每个虚拟机分配512MB内存，则输入512)：" memory_nums
+        reading "每个虚拟机分配多少内存？(若每个虚拟机分配512MB内存，则输入512)：" memory_nums "${PVE_CREATE_MEMORY:-512}"
         if [[ "$memory_nums" =~ ^[1-9][0-9]*$ ]]; then
             break
+        elif is_noninteractive; then
+            _red "PVE_CREATE_MEMORY must be a positive integer in noninteractive mode."
+            _red "无交互模式下 PVE_CREATE_MEMORY 必须是正整数。"
+            exit 1
         else
             _yellow "Invalid input, please enter a positive integer."
             _yellow "输入无效，请输入一个正整数。"
@@ -163,7 +212,7 @@ build_new_vms() {
     done
     while true; do
         _green "On which storage drive are the virtual machines opened? (Leave blank or enter 'local' if the virtual machine is to be opened on the system disk):"
-        reading "虚拟机们开设在哪个存储盘上？(若虚拟机要开设在系统盘上，则留空或输入local)：" storage
+        reading "虚拟机们开设在哪个存储盘上？(若虚拟机要开设在系统盘上，则留空或输入local)：" storage "${PVE_CREATE_STORAGE:-local}"
         if [ -z "$storage" ]; then
             storage="local"
         fi
@@ -171,9 +220,13 @@ build_new_vms() {
     done
     while true; do
         _green "How many hard disks are allocated per virtual machine? (If 5G hard drives are allocated per virtual machine, enter 5):"
-        reading "每个虚拟机分配多少硬盘？(若每个虚拟机分配5G硬盘，则输入5)：" disk_nums
+        reading "每个虚拟机分配多少硬盘？(若每个虚拟机分配5G硬盘，则输入5)：" disk_nums "${PVE_CREATE_DISK:-5}"
         if [[ "$disk_nums" =~ ^[1-9][0-9]*$ ]]; then
             break
+        elif is_noninteractive; then
+            _red "PVE_CREATE_DISK must be a positive integer in noninteractive mode."
+            _red "无交互模式下 PVE_CREATE_DISK 必须是正整数。"
+            exit 1
         else
             _yellow "Invalid input, please enter a positive integer."
             _yellow "输入无效，请输入一个正整数。"
@@ -183,12 +236,12 @@ build_new_vms() {
         while true; do
             sys_status="false"
             _green "What system does each virtual machine use? (Leave blank or enter debian11 if all use debian11):"
-            reading "每个虚拟机都使用什么系统？(若都使用debian11，则留空或输入debian11)：" system
+            reading "每个虚拟机都使用什么系统？(若都使用debian11，则留空或输入debian11)：" system "${PVE_CREATE_SYSTEM:-debian11}"
             if [ -z "$system" ]; then
                 system="debian11"
             fi
             systems=("debian10" "debian11" "debian9" "ubuntu18" "ubuntu20" "ubuntu22" "archlinux" "centos9-stream" "centos8-stream" "almalinux8" "almalinux9" "fedora33" "fedora34" "opensuse-leap-15")
-            for sys in ${systems[@]}; do
+            for sys in "${systems[@]}"; do
                 if [[ "$system" == "$sys" ]]; then
                     sys_status="true"
                     break
@@ -196,21 +249,25 @@ build_new_vms() {
             done
             if [ "$sys_status" = "true" ]; then
                 break
+            elif is_noninteractive; then
+                _red "PVE_CREATE_SYSTEM is not supported for x86 mode: $system"
+                _red "无交互模式下 PVE_CREATE_SYSTEM 不支持当前 x86 取值：$system"
+                exit 1
             else
                 _yellow "This system is not supported, please check https://github.com/spiritLHLS/Images for the names of supported systems"
                 _yellow "不支持该系统，请查看 https://github.com/spiritLHLS/Images 支持的系统名字"
             fi
         done
-    else
+    elif [ "$system_arch" = "arm" ]; then
         while true; do
             sys_status="false"
             _green "What system does each virtual machine use? (Leave blank or enter debian11 if all use debian11):"
-            reading "每个虚拟机都使用什么系统？(若都使用ubuntu22，则留空或输入ubuntu22)：" system
+            reading "每个虚拟机都使用什么系统？(若都使用ubuntu22，则留空或输入ubuntu22)：" system "${PVE_CREATE_SYSTEM:-ubuntu22}"
             if [ -z "$system" ]; then
                 system="ubuntu22"
             fi
             systems=("ubuntu14" "ubuntu16" "ubuntu18" "ubuntu20" "ubuntu22")
-            for sys in ${systems[@]}; do
+            for sys in "${systems[@]}"; do
                 if [[ "$system" == "$sys" ]]; then
                     sys_status="true"
                     break
@@ -218,18 +275,55 @@ build_new_vms() {
             done
             if [ "$sys_status" = "true" ]; then
                 break
+            elif is_noninteractive; then
+                _red "PVE_CREATE_SYSTEM is not supported for ARM mode: $system"
+                _red "无交互模式下 PVE_CREATE_SYSTEM 不支持当前 ARM 取值：$system"
+                exit 1
             else
                 _yellow "Unable to install corresponding system, please check http://cloud-images.ubuntu.com for supported system images "
                 _yellow "无法安装对应系统，请查看 http://cloud-images.ubuntu.com 支持的系统镜像 "
             fi
         done
+    else
+        while true; do
+            sys_status="false"
+            _green "What system does each virtual machine use on riscv64? (Leave blank or enter debian13):"
+            reading "riscv64 上每个虚拟机使用什么系统？(留空或输入 debian13) ：" system "${PVE_CREATE_SYSTEM:-debian13}"
+            if [ -z "$system" ]; then
+                system="debian13"
+            fi
+            systems=("debian12" "debian13")
+            for sys in "${systems[@]}"; do
+                if [[ "$system" == "$sys" ]]; then
+                    sys_status="true"
+                    break
+                fi
+            done
+            if [ "$sys_status" = "true" ]; then
+                break
+            elif is_noninteractive; then
+                _red "PVE_CREATE_SYSTEM is not supported for riscv64 mode: $system"
+                _red "无交互模式下 PVE_CREATE_SYSTEM 不支持当前 riscv64 取值：$system"
+                exit 1
+            else
+                _yellow "On riscv64 experimental VM mode, only debian12/debian13 cloud images are supported by this script"
+                _yellow "当前脚本在 riscv64 实验模式下仅支持 debian12/debian13 云镜像"
+            fi
+        done
     fi
     while true; do
         _green "Need to attach a separate IPV6 address to each virtual machine?([N]/y)"
-        reading "是否附加独立的IPV6地址？([N]/y)" independent_ipv6
+        reading "是否附加独立的IPV6地址？([N]/y)" independent_ipv6 "${PVE_CREATE_IPV6:-n}"
         independent_ipv6=$(echo "$independent_ipv6" | tr '[:upper:]' '[:lower:]')
+        if [ -z "$independent_ipv6" ]; then
+            independent_ipv6="n"
+        fi
         if [ "$independent_ipv6" = "y" ] || [ "$independent_ipv6" = "n" ]; then
             break
+        elif is_noninteractive; then
+            _red "PVE_CREATE_IPV6 must be y or n in noninteractive mode."
+            _red "无交互模式下 PVE_CREATE_IPV6 必须是 y 或 n。"
+            exit 1
         else
             _yellow "Invalid input, please enter y or n."
             _yellow "输入无效，请输入Y或者N。"
@@ -238,14 +332,16 @@ build_new_vms() {
     for ((i = 1; i <= $new_nums; i++)); do
         vm_num=$(($vm_num + 1))
         user=$(cat /dev/urandom | tr -dc 'a-zA-Z' | fold -w 4 | head -n 1)
-        ori=$(date | md5sum)
-        password=${ori:2:9}
+        password=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)
+        if [ -z "$password" ]; then
+            password=$(date +%s%N | md5sum | cut -c 3-14)
+        fi
         ssh_port=$(($web2_port + 1))
         web1_port=$(($web2_port + 2))
         web2_port=$(($web1_port + 1))
         port_start=$(($port_end + 1))
         port_end=$(($port_start + 25))
-        ./buildvm.sh $vm_num $user $password $cpu_nums $memory_nums $disk_nums $ssh_port $web1_port $web2_port $port_start $port_end $system $storage $independent_ipv6
+        ./buildvm.sh "$vm_num" "$user" "$password" "$cpu_nums" "$memory_nums" "$disk_nums" "$ssh_port" "$web1_port" "$web2_port" "$port_start" "$port_end" "$system" "$storage" "$independent_ipv6"
         cat "vm$vm_num" >>vmlog
         rm -rf "vm$vm_num"
         if [ "$i" = "$new_nums" ]; then
@@ -258,8 +354,19 @@ build_new_vms() {
 pre_check
 get_system_arch
 if [ -z "${system_arch}" ] || [ ! -v system_arch ]; then
-    _red "This script can only run on machines under x86_64 or arm architecture."
+    _red "This script can only run on machines under x86_64, arm64, or riscv64 architecture."
     exit 1
+fi
+if [ "$system_arch" = "riscv64" ]; then
+    if [[ "${PVE_RISCV_VM_EXPERIMENTAL^^}" != "TRUE" ]]; then
+        _yellow "riscv64 VM automation is experimental and disabled by default"
+        _yellow "riscv64 的虚拟机自动化为实验功能，默认关闭"
+        _yellow "Set PVE_RISCV_VM_EXPERIMENTAL=true to continue, or use CT workflows"
+        _yellow "如需继续请设置 PVE_RISCV_VM_EXPERIMENTAL=true，或优先使用 CT 工作流"
+        exit 1
+    fi
+    _yellow "Experimental riscv64 VM mode is enabled; fallback to TCG software virtualization is expected"
+    _yellow "已启用 riscv64 实验虚拟机模式；预计将使用 TCG 软件虚拟化回退路径"
 fi
 check_info
 build_new_vms

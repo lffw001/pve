@@ -1,9 +1,9 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/pve
-# 2026.02.28
+# 2026.08.27
 # ./pve_delete.sh arg1 arg2
-# arg 可填入虚拟机/容器的序号，可以有任意多个
+# arg 可填入虚拟机/容器的序号，可以有任意多个；或使用 all 删除全部
 # 日志 /var/log/pve_delete.log
 
 set -e
@@ -26,7 +26,7 @@ check_vmct_status() {
             if [ "$(qm status "$id" 2>/dev/null | grep -w "status:" | awk '{print $2}')" = "stopped" ]; then
                 return 0
             fi
-            elif [ "$type" = "ct" ]; then
+        elif [ "$type" = "ct" ]; then
             # 检查容器是否已经停止
             if [ "$(pct status "$id" 2>/dev/null | grep -w "status:" | awk '{print $2}')" = "stopped" ]; then
                 return 0
@@ -46,28 +46,238 @@ safe_remove() {
     fi
 }
 
+is_ipv4_address() {
+    local ip=$1
+    local IFS=.
+    local -a octets=()
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    read -r -a octets <<< "$ip"
+    [ "${#octets[@]}" -eq 4 ] || return 1
+    local octet
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        [ "$octet" -le 255 ] || return 1
+    done
+    return 0
+}
+
+extract_first_ipv4_from_config() {
+    local config_text=$1
+    local candidate=""
+
+    while IFS= read -r candidate; do
+        if is_ipv4_address "$candidate"; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done < <(printf '%s\n' "$config_text" | grep -oE '(^|[,[:space:]])ip=([0-9]{1,3}\.){3}[0-9]{1,3}' | sed 's/.*ip=//')
+
+    printf ''
+    return 0
+}
+
+extract_first_public_ipv6_from_config() {
+    local config_text=$1
+
+    command -v python3 >/dev/null 2>&1 || {
+        printf ''
+        return 0
+    }
+    python3 - "$config_text" <<'PY'
+import ipaddress
+import re
+import sys
+
+for match in re.finditer(r"(?:^|[,\s])ip6=([^,\s]+)", sys.argv[1]):
+    value = match.group(1).split("/", 1)[0]
+    try:
+        address = ipaddress.IPv6Address(value)
+    except ValueError:
+        continue
+    if address.is_global:
+        print(address.compressed)
+        break
+PY
+}
+
+delete_nft_ipv4_rules_for_ip() {
+    local ip_address=$1
+    local chain=""
+
+    [ -n "$ip_address" ] || return 0
+    for chain in prerouting postrouting; do
+        nft -a list chain ip nat "$chain" 2>/dev/null |
+            awk -v ip="$ip_address" '
+                BEGIN {
+                    escaped = ip
+                    gsub(/\./, "\\.", escaped)
+                    boundary_re = "(^|[^0-9.])" escaped "([^0-9.]|$)"
+                }
+                $0 ~ boundary_re && match($0, /# handle [0-9]+/) {
+                    handle = substr($0, RSTART + 9, RLENGTH - 9)
+                    print handle
+                }
+            ' |
+            while IFS= read -r h; do
+                [ -n "$h" ] && nft delete rule ip nat "$chain" handle "$h" 2>/dev/null || true
+            done
+    done
+}
+
+delete_iptables_ipv4_rules_for_ip() {
+    local ip_address=$1
+    local escaped_ip=""
+
+    [ -n "$ip_address" ] || return 0
+    [ -f /etc/iptables/rules.v4 ] || return 0
+    escaped_ip="${ip_address//./\\.}"
+    sed -i -E "/(^|[^0-9.])${escaped_ip}([^0-9.]|$)/d" /etc/iptables/rules.v4
+}
+
+declare -A STORAGE_VOLUMES_BY_ID
+
+build_storage_volume_index() {
+    local storages=""
+    local storage=""
+    local volume_rows=""
+    local volid=""
+    local owner_id=""
+
+    STORAGE_VOLUMES_BY_ID=()
+    storages=$(pvesm status 2>/dev/null | awk 'NR > 1 {print $1}' || true)
+    while IFS= read -r storage; do
+        [ -z "$storage" ] && continue
+        volume_rows=$(pvesm list "$storage" 2>/dev/null | awk 'NR > 1 && $5 ~ /^[0-9]+$/ {print $1, $5}' || true)
+        while read -r volid owner_id; do
+            [ -z "$volid" ] && continue
+            [ -z "$owner_id" ] && continue
+            STORAGE_VOLUMES_BY_ID["$owner_id"]+="${volid}"$'\n'
+        done <<<"$volume_rows"
+    done <<<"$storages"
+}
+
+cleanup_indexed_volume_files() {
+    local id=$1
+    local kind=$2
+    local volid=""
+    local vol_path=""
+    local volumes="${STORAGE_VOLUMES_BY_ID[$id]-}"
+
+    if [ -z "$volumes" ]; then
+        log "No indexed storage volumes found for ${kind} $id"
+        return 0
+    fi
+
+    while IFS= read -r volid; do
+        [ -z "$volid" ] && continue
+        vol_path=$(pvesm path "$volid" 2>/dev/null || true)
+        if [ -n "$vol_path" ]; then
+            safe_remove "$vol_path"
+        else
+            log "Warning: Failed to resolve path for volume $volid"
+        fi
+    done <<<"$volumes"
+}
+
+# 防火墙后端自动识别（优先读取 interfaces 配置痕迹）
+FW_BACKEND=""
+
+get_interfaces_content() {
+    {
+        [ -f /etc/network/interfaces ] && cat /etc/network/interfaces
+        [ -d /etc/network/interfaces.d ] && cat /etc/network/interfaces.d/* 2>/dev/null || true
+    } 2>/dev/null || true
+}
+
+detect_firewall_backend() {
+    local interfaces_content
+    interfaces_content=$(get_interfaces_content)
+    local has_nft=1
+    local has_ipt=1
+
+    if command -v nft >/dev/null 2>&1 && nft list tables >/dev/null 2>&1; then
+        has_nft=0
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        has_ipt=0
+    fi
+
+    if echo "$interfaces_content" | grep -qiE '(^|[^a-z])(nft|nftables)($|[^a-z])'; then
+        FW_BACKEND="nft"
+    elif echo "$interfaces_content" | grep -qiE '(^|[^a-z])(iptables|ip6tables|netfilter-persistent)($|[^a-z])'; then
+        FW_BACKEND="iptables"
+    elif [ -f /etc/nftables.conf ] && [ $has_nft -eq 0 ]; then
+        FW_BACKEND="nft"
+    elif [ -f /etc/iptables/rules.v4 ] && [ $has_ipt -eq 0 ]; then
+        FW_BACKEND="iptables"
+    elif [ $has_nft -eq 0 ] && [ $has_ipt -ne 0 ]; then
+        FW_BACKEND="nft"
+    elif [ $has_ipt -eq 0 ]; then
+        FW_BACKEND="iptables"
+    else
+        FW_BACKEND="nft"
+    fi
+
+    log "Detected firewall backend: ${FW_BACKEND}"
+}
+
+use_nft_backend() {
+    [ "$FW_BACKEND" = "nft" ] && command -v nft >/dev/null 2>&1 && nft list tables >/dev/null 2>&1
+}
+
+should_restart_ndpresponder() {
+    if [ ! -f "/usr/local/bin/ndpresponder" ]; then
+        return 1
+    fi
+    if ! systemctl list-unit-files ndpresponder.service >/dev/null 2>&1; then
+        return 1
+    fi
+    if systemctl is-enabled --quiet ndpresponder.service 2>/dev/null || systemctl is-active --quiet ndpresponder.service 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
 # 清理IPv6 NAT映射规则
 cleanup_ipv6_nat_rules() {
     local vmctid=$1
     local appended_file="/usr/local/bin/pve_appended_content.txt"
     local rules_file="/usr/local/bin/ipv6_nat_rules.sh"
     local used_ips_file="/usr/local/bin/pve_used_vmbr1_ips.txt"
+    local state_dir="${PVE_STATE_DIR:-/usr/local/bin}"
     if [ -s "$appended_file" ]; then
         log "Cleaning up IPv6 NAT rules for VM $vmctid"
-        local vm_internal_ipv6="2001:db8:1::${vmctid}"
+        local vm_internal_ipv6=""
+        if [ -s "${state_dir%/}/pve_nat_ipv6_subnet" ] && command -v python3 >/dev/null 2>&1; then
+            vm_internal_ipv6=$(python3 - "$(cat "${state_dir%/}/pve_nat_ipv6_subnet")" "$vmctid" <<'PY'
+import ipaddress
+import sys
+try:
+    network = ipaddress.IPv6Network(sys.argv[1], strict=False)
+    value = ipaddress.IPv6Address(int(network.network_address) + int(sys.argv[2]))
+    print(value if value in network else "")
+except ValueError:
+    print("")
+PY
+)
+        fi
+        if [ -z "$vm_internal_ipv6" ]; then
+            log "No persisted PVE IPv6 NAT subnet for ${vmctid}; skipping IPv6 NAT cleanup"
+            return 0
+        fi
         local host_external_ipv6=""
-        if command -v nft >/dev/null 2>&1 && nft list tables >/dev/null 2>&1; then
+        if use_nft_backend; then
             # nftables: find and remove matching rules
-            host_external_ipv6=$(nft list chain ip6 nat prerouting 2>/dev/null | grep "dnat to $vm_internal_ipv6" | sed 's/.*ip6 daddr \([^ ]*\).*/\1/' | head -1)
+            host_external_ipv6=$(nft list chain ip6 nat prerouting 2>/dev/null | grep -F "dnat to $vm_internal_ipv6" | sed 's/.*ip6 daddr \([^ ]*\).*/\1/' | head -1)
             if [ -n "$host_external_ipv6" ]; then
                 log "Removing nftables IPv6 NAT rules: $vm_internal_ipv6 -> $host_external_ipv6"
                 for chain in prerouting postrouting; do
-                    nft -a list chain ip6 nat $chain 2>/dev/null | grep -E "$vm_internal_ipv6|$host_external_ipv6" | sed 's/.*# handle //' | awk '{print $1}' | while read -r h; do
+                    nft -a list chain ip6 nat $chain 2>/dev/null | grep -F -e "$vm_internal_ipv6" -e "$host_external_ipv6" | sed 's/.*# handle //' | awk '{print $1}' | while read -r h; do
                         nft delete rule ip6 nat $chain handle "$h" 2>/dev/null || true
                     done
                 done
                 # 同时清除该隙道IPv6地址的ICMPv6 ping屏蔽规则
-                nft -a list chain ip6 raw prerouting 2>/dev/null | grep "$host_external_ipv6" | sed 's/.*# handle //' | awk '{print $1}' | while read -r h; do
+                nft -a list chain ip6 raw prerouting 2>/dev/null | grep -F "$host_external_ipv6" | sed 's/.*# handle //' | awk '{print $1}' | while read -r h; do
                     nft delete rule ip6 raw prerouting handle "$h" 2>/dev/null || true
                 done
                 printf '#!/usr/sbin/nft -f\nflush ruleset\n' > /etc/nftables.conf
@@ -96,27 +306,166 @@ cleanup_ipv6_nat_rules() {
     fi
 }
 
+# Resolve the exact direct IPv6 assignment used by the VM/CT builders.  New
+# installations persist the delegated prefix and bridge gateway, while older
+# installations only have the host address and prefix length.
+resolve_vmbr2_icmpv6_rule_values() {
+    local vmctid=$1
+    local configured_ipv6="${2:-}"
+    local state_dir="${PVE_STATE_DIR:-/usr/local/bin}"
+    local direct_prefix_file direct_gateway_file host_ipv6_file prefixlen_file
+    local direct_prefix="" direct_gateway="" host_ipv6="" prefixlen="" resolved=""
+
+    state_dir="${state_dir%/}"
+    direct_prefix_file="${state_dir}/pve_direct_ipv6_prefix"
+    direct_gateway_file="${state_dir}/pve_direct_ipv6_gateway"
+    host_ipv6_file="${state_dir}/pve_check_ipv6"
+    prefixlen_file="${state_dir}/pve_ipv6_prefixlen"
+    command -v python3 >/dev/null 2>&1 || return 1
+
+    # Treat a partial direct-assignment state as invalid instead of falling
+    # back to a host-derived address that could remove another guest's rule.
+    if [ -e "$direct_prefix_file" ] || [ -e "$direct_gateway_file" ]; then
+        [ -s "$direct_prefix_file" ] && [ -s "$direct_gateway_file" ] || return 1
+        direct_prefix=$(cat "$direct_prefix_file")
+        direct_gateway=$(cat "$direct_gateway_file")
+        resolved=$(python3 - direct "$direct_prefix" "$direct_gateway" "$vmctid" <<'PY'
+import ipaddress
+import sys
+
+try:
+    mode, prefix_value, gateway_value, identifier_value = sys.argv[1:]
+    identifier = int(identifier_value, 10)
+except ValueError:
+    raise SystemExit(1)
+
+if mode == "direct":
+    try:
+        network = ipaddress.IPv6Network(prefix_value, strict=False)
+        gateway = ipaddress.IPv6Address(gateway_value)
+    except ValueError:
+        raise SystemExit(1)
+    if gateway not in network or identifier < 100 or identifier > 256:
+        raise SystemExit(1)
+
+    # This is intentionally identical to pve_direct_ipv6_for_id in the VM/CT
+    # configuration scripts, including gateway and small-prefix collisions.
+    def historical_candidate(vm_id):
+        candidate = ipaddress.IPv6Address((int(gateway) & ~((1 << 64) - 1)) | vm_id)
+        if candidate in network:
+            return candidate
+        if vm_id >= network.num_addresses:
+            return None
+        return ipaddress.IPv6Address(int(network.network_address) + vm_id)
+
+    assignments = {}
+    assigned_addresses = set()
+    fallback_ids = []
+    for vm_id in range(100, 257):
+        candidate = historical_candidate(vm_id)
+        if (
+            candidate is None
+            or candidate == network.network_address
+            or candidate == gateway
+            or candidate in assigned_addresses
+        ):
+            fallback_ids.append(vm_id)
+            continue
+        assignments[vm_id] = candidate
+        assigned_addresses.add(candidate)
+
+    for vm_id in fallback_ids:
+        for offset in range(1, network.num_addresses):
+            candidate = ipaddress.IPv6Address(int(network.network_address) + offset)
+            if candidate != gateway and candidate not in assigned_addresses:
+                assignments[vm_id] = candidate
+                assigned_addresses.add(candidate)
+                break
+        else:
+            raise SystemExit(1)
+
+    address = assignments[identifier]
+    source = network
+else:
+    raise SystemExit(1)
+
+print(f"{address.compressed}\t{source.with_prefixlen}")
+PY
+) || return 1
+    else
+        [ -s "$host_ipv6_file" ] || return 1
+        host_ipv6=$(cat "$host_ipv6_file")
+        [ -s "$prefixlen_file" ] && prefixlen=$(cat "$prefixlen_file")
+        resolved=$(python3 - legacy "$host_ipv6" "$prefixlen" "$vmctid" "$configured_ipv6" <<'PY'
+import ipaddress
+import sys
+
+try:
+    mode, host_value, prefixlen_value, identifier_value, configured_value = sys.argv[1:]
+    host = ipaddress.IPv6Address(host_value)
+    identifier = int(identifier_value, 10)
+except ValueError:
+    raise SystemExit(1)
+if mode != "legacy" or identifier < 0:
+    raise SystemExit(1)
+
+# A recently upgraded direct bridge can have no persisted prefix state even
+# though its VM/CT already carries the current decimal assignment. Use that
+# observed address when it belongs to the legacy host prefix.
+network = None
+if prefixlen_value:
+    try:
+        network = ipaddress.IPv6Network((host, int(prefixlen_value, 10)), strict=False)
+    except ValueError:
+        network = None
+
+if configured_value:
+    try:
+        address = ipaddress.IPv6Address(configured_value)
+    except ValueError:
+        raise SystemExit(1)
+    if network is not None and address not in network:
+        raise SystemExit(1)
+else:
+    # Preserve the legacy last-hextet convention for hosts that predate
+    # persisted direct-prefix state. ipaddress validates and normalizes it.
+    try:
+        address = ipaddress.IPv6Address(f"{host_value.rsplit(':', 1)[0]}:{identifier}")
+    except ValueError:
+        raise SystemExit(1)
+
+source = network.with_prefixlen if network is not None else ""
+
+print(f"{address.compressed}\t{source}")
+PY
+) || return 1
+    fi
+
+    [ -n "$resolved" ] || return 1
+    printf '%s\n' "$resolved"
+}
+
 # 清理vmbr2直接分配IPv6（HE隧道/原生子网）模式的ICMPv6 ping屏蔽规则
 cleanup_vmbr2_icmpv6_rule() {
     local vmctid=$1
-    if [ ! -f /usr/local/bin/pve_check_ipv6 ]; then
+    local configured_ipv6="${2:-}"
+    local resolved="" ipv6_addr="" local_prefix_del=""
+
+    if ! resolved=$(resolve_vmbr2_icmpv6_rule_values "$vmctid" "$configured_ipv6"); then
+        log "No valid direct IPv6 assignment state for ${vmctid}; skipping ICMPv6 rule cleanup"
         return 0
     fi
-    local host_ipv6
-    host_ipv6=$(cat /usr/local/bin/pve_check_ipv6)
-    local ipv6_addr="${host_ipv6%:*}:${vmctid}"
+    IFS=$'\t' read -r ipv6_addr local_prefix_del <<<"$resolved"
+    [ -n "$ipv6_addr" ] || return 0
     log "Cleaning up ICMPv6 ping block rule for $ipv6_addr"
-    if command -v nft >/dev/null 2>&1 && nft list tables >/dev/null 2>&1; then
-        nft -a list chain ip6 raw prerouting 2>/dev/null | grep "$ipv6_addr" | sed 's/.*# handle //' | awk '{print $1}' | while read -r h; do
+    if use_nft_backend; then
+        nft -a list chain ip6 raw prerouting 2>/dev/null | grep -F "$ipv6_addr" | sed 's/.*# handle //' | awk '{print $1}' | while read -r h; do
             nft delete rule ip6 raw prerouting handle "$h" 2>/dev/null || true
         done
         printf '#!/usr/sbin/nft -f\nflush ruleset\n' > /etc/nftables.conf
         nft list ruleset >> /etc/nftables.conf
     else
-        local ipv6_prefixlen_del=""
-        [ -f /usr/local/bin/pve_ipv6_prefixlen ] && ipv6_prefixlen_del=$(cat /usr/local/bin/pve_ipv6_prefixlen)
-        if [ -n "$ipv6_prefixlen_del" ]; then
-            local local_prefix_del="${host_ipv6%:*}:/${ipv6_prefixlen_del}"
+        if [ -n "$local_prefix_del" ]; then
             ip6tables -t raw -D PREROUTING -d "$ipv6_addr" -s "$local_prefix_del" -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null || true
             ip6tables -t raw -D PREROUTING -d "$ipv6_addr" -s fe80::/10 -p icmpv6 --icmpv6-type echo-request -j ACCEPT 2>/dev/null || true
         fi
@@ -131,18 +480,7 @@ cleanup_vmbr2_icmpv6_rule() {
 cleanup_vm_files() {
     local vmid=$1
     log "Cleaning up files for VM $vmid"
-    # 获取所有存储名称
-    pvesm status | awk 'NR > 1 {print $1}' | while read -r storage; do
-        # 遍历存储并列出相关的卷
-        pvesm list "$storage" | awk -v vmid="$vmid" '$5 == vmid {print $1}' | while read -r volid; do
-            vol_path=$(pvesm path "$volid" 2>/dev/null || true)
-            if [ -n "$vol_path" ]; then
-                safe_remove "$vol_path"
-            else
-                log "Warning: Failed to resolve path for volume $volid in storage $storage"
-            fi
-        done
-    done
+    cleanup_indexed_volume_files "$vmid" "VM"
     rm -rf "/root/vm${vmid}"
     # 清理 macOS VM 专属 opencore ISO（由 buildvm_macos.sh 的 SMBIOS 注入流程生成）
     local opencore_iso="/var/lib/vz/template/iso/opencore_${vmid}.iso"
@@ -156,18 +494,7 @@ cleanup_vm_files() {
 cleanup_ct_files() {
     local ctid=$1
     log "Cleaning up files for CT $ctid"
-    # 获取所有存储名称
-    pvesm status | awk 'NR > 1 {print $1}' | while read -r storage; do
-        # 遍历存储并列出相关的卷
-        pvesm list "$storage" | awk -v ctid="$ctid" '$5 == ctid {print $1}' | while read -r volid; do
-            vol_path=$(pvesm path "$volid" 2>/dev/null || true)
-            if [ -n "$vol_path" ]; then
-                safe_remove "$vol_path"
-            else
-                log "Warning: Failed to resolve path for volume $volid in storage $storage"
-            fi
-        done
-    done
+    cleanup_indexed_volume_files "$ctid" "CT"
     rm -rf "/root/ct${ctid}"
 }
 
@@ -175,6 +502,7 @@ cleanup_ct_files() {
 handle_vm_deletion() {
     local vmid=$1
     local ip_address=$2
+    local configured_ipv6="${3:-}"
     log "Starting deletion process for VM $vmid (IP: $ip_address)"
     # 解锁VM
     log "Attempting to unlock VM $vmid"
@@ -192,20 +520,16 @@ handle_vm_deletion() {
     # 清理IPv6 NAT映射规则
     cleanup_ipv6_nat_rules "$vmid"
     # 清理vmbr2模式 ICMPv6 屏蔽规则
-    cleanup_vmbr2_icmpv6_rule "$vmid"
+    cleanup_vmbr2_icmpv6_rule "$vmid" "$configured_ipv6"
     # 清理相关文件
     cleanup_vm_files "$vmid"
     # 更新防火墙规则
     if [ -n "$ip_address" ]; then
         log "Removing firewall rules for IP $ip_address"
-        if command -v nft >/dev/null 2>&1 && nft list tables >/dev/null 2>&1; then
-            for chain in prerouting postrouting; do
-                nft -a list chain ip nat $chain 2>/dev/null | grep "$ip_address" | sed 's/.*# handle //' | awk '{print $1}' | while read -r h; do
-                    nft delete rule ip nat $chain handle "$h" 2>/dev/null || true
-                done
-            done
+        if use_nft_backend; then
+            delete_nft_ipv4_rules_for_ip "$ip_address"
         else
-            [ -f /etc/iptables/rules.v4 ] && sed -i "/$ip_address:/d" /etc/iptables/rules.v4
+            delete_iptables_ipv4_rules_for_ip "$ip_address"
         fi
     fi
 }
@@ -214,6 +538,7 @@ handle_vm_deletion() {
 handle_ct_deletion() {
     local ctid=$1
     local ip_address=$2
+    local configured_ipv6="${3:-}"
     log "Starting deletion process for CT $ctid (IP: $ip_address)"
     # 停止容器
     log "Stopping CT $ctid"
@@ -230,95 +555,110 @@ handle_ct_deletion() {
     # 清理IPv6 NAT映射规则
     cleanup_ipv6_nat_rules "$ctid"
     # 清理vmbr2模式 ICMPv6 屏蔽规则
-    cleanup_vmbr2_icmpv6_rule "$ctid"
+    cleanup_vmbr2_icmpv6_rule "$ctid" "$configured_ipv6"
     # 更新防火墙规则
     if [ -n "$ip_address" ]; then
         log "Removing firewall rules for IP $ip_address"
-        if command -v nft >/dev/null 2>&1 && nft list tables >/dev/null 2>&1; then
-            for chain in prerouting postrouting; do
-                nft -a list chain ip nat $chain 2>/dev/null | grep "$ip_address" | sed 's/.*# handle //' | awk '{print $1}' | while read -r h; do
-                    nft delete rule ip nat $chain handle "$h" 2>/dev/null || true
-                done
-            done
+        if use_nft_backend; then
+            delete_nft_ipv4_rules_for_ip "$ip_address"
         else
-            [ -f /etc/iptables/rules.v4 ] && sed -i "/$ip_address:/d" /etc/iptables/rules.v4
+            delete_iptables_ipv4_rules_for_ip "$ip_address"
         fi
     fi
 }
 
 # 主函数
 main() {
+    local config_text="" ip_address="" ipv6_address=""
     # 检查参数
     if [ $# -eq 0 ]; then
-        echo "Usage: $0 <VMID/CTID> [VMID/CTID...]"
+        echo "Usage: $0 <VMID/CTID|all> [VMID/CTID...]"
         exit 1
     fi
+    detect_firewall_backend
     # 创建唯一ID数组
     declare -A unique_ids
+    local delete_all=false
     for arg in "$@"; do
-        if [[ "$arg" =~ ^[0-9]+$ ]]; then
+        if [ "${arg,,}" = "all" ]; then
+            delete_all=true
+        elif [[ "$arg" =~ ^[0-9]+$ ]]; then
             unique_ids["$arg"]=1
         else
             log "Warning: Invalid ID format: $arg"
         fi
     done
     # 获取所有VM和CT的IP信息
-    declare -A vmip_array
-    declare -A ctip_array
+    declare -A vmip_array vmipv6_array ctip_array ctipv6_array
     # 获取VM的IP
     vmids=$(qm list | awk '{if(NR>1)print $1}')
     if [ -n "$vmids" ]; then
         for vmid in $vmids; do
-            ip_address=$(qm config "$vmid" | grep -oP 'ip=\K[0-9.]+' || true)
-            if [ -n "$ip_address" ]; then
-                vmip_array["$vmid"]=$ip_address
-            fi
+            config_text=$(qm config "$vmid" 2>/dev/null || true)
+            ip_address=$(extract_first_ipv4_from_config "$config_text")
+            ipv6_address=$(extract_first_public_ipv6_from_config "$config_text")
+            vmip_array["$vmid"]="${ip_address:-}"
+            vmipv6_array["$vmid"]="${ipv6_address:-}"
         done
     fi
     # 获取CT的IP
     ctids=$(pct list | awk '{if(NR>1)print $1}')
     if [ -n "$ctids" ]; then
         for ctid in $ctids; do
-            ip_address=$(pct config "$ctid" | grep -oP 'ip=\K[0-9.]+' || true)
-            if [ -n "$ip_address" ]; then
-                ctip_array["$ctid"]=$ip_address
-            fi
+            config_text=$(pct config "$ctid" 2>/dev/null || true)
+            ip_address=$(extract_first_ipv4_from_config "$config_text")
+            ipv6_address=$(extract_first_public_ipv6_from_config "$config_text")
+            ctip_array["$ctid"]="${ip_address:-}"
+            ctipv6_array["$ctid"]="${ipv6_address:-}"
         done
     fi
+    if [ "$delete_all" = true ]; then
+        log "Deleting all existing VMs and CTs"
+        for vmid in $vmids; do
+            unique_ids["$vmid"]=1
+        done
+        for ctid in $ctids; do
+            unique_ids["$ctid"]=1
+        done
+    fi
+    build_storage_volume_index
     # 处理删除操作
     for id in "${!unique_ids[@]}"; do
         if [ -n "${vmip_array[$id]+x}" ]; then
-            handle_vm_deletion "$id" "${vmip_array[$id]}"
-            elif [ -n "${ctip_array[$id]+x}" ]; then
-            handle_ct_deletion "$id" "${ctip_array[$id]}"
+            handle_vm_deletion "$id" "${vmip_array[$id]}" "${vmipv6_array[$id]-}"
+        elif [ -n "${ctip_array[$id]+x}" ]; then
+            handle_ct_deletion "$id" "${ctip_array[$id]}" "${ctipv6_array[$id]-}"
         else
             log "Warning: ID $id not found in existing VMs or CTs"
         fi
     done
     # 重建防火墙规则
     log "Rebuilding firewall rules..."
-    if command -v nft >/dev/null 2>&1 && nft list tables >/dev/null 2>&1; then
+    if use_nft_backend; then
         printf '#!/usr/sbin/nft -f\nflush ruleset\n' > /etc/nftables.conf
         nft list ruleset >> /etc/nftables.conf
     else
         if [ -f "/etc/iptables/rules.v4" ]; then
-            cat /etc/iptables/rules.v4 | iptables-restore
+            iptables-restore < /etc/iptables/rules.v4
         else
             log "Warning: iptables rules file not found"
         fi
     fi
     # 重启ndpresponder服务
-    if [ -f "/usr/local/bin/ndpresponder" ]; then
+    if should_restart_ndpresponder; then
         log "Restarting ndpresponder service..."
-        systemctl restart ndpresponder.service
+        systemctl restart ndpresponder.service 2>/dev/null || true
+    else
+        log "Skipping ndpresponder restart: service not in use"
     fi
     log "Operation completed successfully"
     echo "Finish."
 }
-# 检查是否为root用户
-if [ "$(id -u)" != "0" ]; then
-    echo "This script must be run as root"
-    exit 1
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    # 检查是否为root用户
+    if [ "$(id -u)" != "0" ]; then
+        echo "This script must be run as root"
+        exit 1
+    fi
+    main "$@"
 fi
-# 运行主函数
-main "$@"

@@ -3,12 +3,44 @@
 # https://github.com/oneclickvirt/pve
 # 2025.07.06
 # 不支持debian13及更新版本的debian，未对sysctl做适配
+export DEBIAN_FRONTEND=noninteractive
+is_noninteractive() {
+    case "${noninteractive:-}" in
+    true | TRUE | True | 1 | yes | YES | Yes | y | Y)
+        return 0
+        ;;
+    esac
+    case "${NONINTERACTIVE:-}" in
+    true | TRUE | True | 1 | yes | YES | Yes | y | Y)
+        return 0
+        ;;
+    esac
+    return 1
+}
+detect_wifi_interface() {
+    ip -o link show | awk -F': ' '
+        {
+            iface = $2
+            sub(/@.*/, "", iface)
+            if (iface ~ /^(wlp|wlan|wlx|wl)[[:alnum:]_.-]*$/) {
+                print iface
+                exit
+            }
+        }
+    '
+}
+validate_interface_name() {
+    local iface="$1"
+    [[ "$iface" =~ ^[A-Za-z0-9_.-]+$ ]]
+}
 cd /mnt/wireless || exit 1
+shopt -s nullglob
+deb_files=(*.deb)
 for i in {1..6}; do
     INSTALLED_PACKAGES=""
     FAILED_PACKAGES=""
-    for deb in *.deb; do
-        if apt install -y "./$deb" &>/dev/null; then
+    for deb in "${deb_files[@]}"; do
+        if apt-get install -y "./$deb" &>/dev/null; then
             INSTALLED_PACKAGES="$INSTALLED_PACKAGES $deb"
         else
             FAILED_PACKAGES="$FAILED_PACKAGES $deb"
@@ -25,34 +57,66 @@ if [ -n "$FAILED_PACKAGES" ]; then
     echo "Failed to install packages:$FAILED_PACKAGES"
 fi
 rfkill unblock wifi
-WIFI_INTERFACE=$(ip a | grep -o "wlp[^:]*" | head -1)
+WIFI_INTERFACE="${WIFI_INTERFACE:-$(detect_wifi_interface)}"
+WIFI_INTERFACE="${WIFI_INTERFACE%%@*}"
 if [ -z "$WIFI_INTERFACE" ]; then
     echo "Could not detect WiFi interface"
+    echo "Set WIFI_INTERFACE manually, for example: export WIFI_INTERFACE=wlan0"
+    echo "无法检测无线网卡接口，可手动设置 WIFI_INTERFACE，例如：export WIFI_INTERFACE=wlan0"
     exit 1
 fi
+if ! validate_interface_name "$WIFI_INTERFACE"; then
+    echo "Invalid WiFi interface name: $WIFI_INTERFACE"
+    echo "无线网卡接口名无效：$WIFI_INTERFACE"
+    exit 1
+fi
+WIFI_INTERFACE_REGEX=$(printf '%s' "$WIFI_INTERFACE" | sed 's/[][\\.^$*+?{}()|/]/\\&/g')
 echo "Detected WiFi interface: $WIFI_INTERFACE"
-while true; do
-    read -p "Enter WiFi SSID: " SSID
-    read -p "Enter WiFi Password: " PASSWORD
-    echo "WiFi Configuration:"
-    echo "SSID: $SSID"
-    echo "Password: $PASSWORD"
-    read -p "Is this correct? (y/n): " CONFIRM
-    if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-        SCAN_RESULT=$(iwlist $WIFI_INTERFACE scan 2>/dev/null | grep -i "ESSID:\"$SSID\"")
+if is_noninteractive; then
+    SSID="${WIFI_SSID:-}"
+    PASSWORD="${WIFI_PASSWORD:-}"
+    if [ -z "$SSID" ] || [ -z "$PASSWORD" ]; then
+        echo "noninteractive=true requires WIFI_SSID and WIFI_PASSWORD"
+        echo "无交互模式需要设置 WIFI_SSID 和 WIFI_PASSWORD"
+        exit 1
+    fi
+    if [[ "${WIFI_SKIP_SCAN^^}" != "TRUE" ]]; then
+        SCAN_RESULT=$(iwlist "$WIFI_INTERFACE" scan 2>/dev/null | grep -iF "ESSID:\"$SSID\"")
         if [ -n "$SCAN_RESULT" ]; then
-            break
+            echo "WiFi network '$SSID' found."
         else
             echo "Error: WiFi network '$SSID' not found in available networks."
-            echo "Please check the SSID and try again."
+            echo "Set WIFI_SKIP_SCAN=true if the SSID is hidden or scanning is unavailable."
+            echo "如果 SSID 隐藏或扫描不可用，可设置 WIFI_SKIP_SCAN=true。"
             echo "Available networks:"
-            iwlist $WIFI_INTERFACE scan 2>/dev/null | grep "ESSID:" | grep -v "ESSID:\"\"" | sort | uniq
+            iwlist "$WIFI_INTERFACE" scan 2>/dev/null | grep "ESSID:" | grep -v "ESSID:\"\"" | sort | uniq
+            exit 1
+        fi
+    fi
+else
+    while true; do
+        read -r -p "Enter WiFi SSID: " SSID
+        read -r -p "Enter WiFi Password: " PASSWORD
+        echo "WiFi Configuration:"
+        echo "SSID: $SSID"
+        echo "Password: ********"
+        read -r -p "Is this correct? (y/n): " CONFIRM
+        if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+            SCAN_RESULT=$(iwlist "$WIFI_INTERFACE" scan 2>/dev/null | grep -iF "ESSID:\"$SSID\"")
+            if [ -n "$SCAN_RESULT" ]; then
+                break
+            else
+                echo "Error: WiFi network '$SSID' not found in available networks."
+                echo "Please check the SSID and try again."
+                echo "Available networks:"
+                iwlist "$WIFI_INTERFACE" scan 2>/dev/null | grep "ESSID:" | grep -v "ESSID:\"\"" | sort | uniq
+                echo "Please re-enter the WiFi credentials..."
+            fi
+        else
             echo "Please re-enter the WiFi credentials..."
         fi
-    else
-        echo "Please re-enter the WiFi credentials..."
-    fi
-done
+    done
+fi
 rm -rf /etc/wpa_supplicant/wpa_supplicant.conf
 wpa_passphrase "$SSID" "$PASSWORD" >> /etc/wpa_supplicant/wpa_supplicant.conf
 if [ ! -f /etc/systemd/system/wpa_supplicant.service ]; then
@@ -76,11 +140,11 @@ Alias=dbus-fi.w1.wpa_supplicant1.service
 EOF
     systemctl daemon-reload
 fi
-if ! grep -q "^auto $WIFI_INTERFACE$" /etc/network/interfaces; then
-    if grep -q "^iface $WIFI_INTERFACE inet \(auto\|static\|manual\)" /etc/network/interfaces; then
+if ! grep -Fxq "auto $WIFI_INTERFACE" /etc/network/interfaces; then
+    if grep -q "^iface $WIFI_INTERFACE_REGEX inet \(auto\|static\|manual\)" /etc/network/interfaces; then
         echo "Found existing iface configuration for $WIFI_INTERFACE, commenting it out..."
         cp /etc/network/interfaces /etc/network/interfaces.backup
-        sed -i "/^iface $WIFI_INTERFACE inet \(auto\|static\|manual\)/,/^$/s/^/#/" /etc/network/interfaces
+        sed -i "/^iface $WIFI_INTERFACE_REGEX inet \(auto\|static\|manual\)/,/^$/s/^/#/" /etc/network/interfaces
     fi
     if grep -q '^iface vmbr0 inet static' /etc/network/interfaces && \
        ! grep -A 5 '^iface vmbr0 inet static' /etc/network/interfaces | grep -q '^\s*metric\s\+100'; then
@@ -111,9 +175,9 @@ EOF
 else
     echo "Network interface $WIFI_INTERFACE already configured"
 fi
-ifup $WIFI_INTERFACE
+ifup "$WIFI_INTERFACE"
 sleep 5
-ip link set $WIFI_INTERFACE up
+ip link set "$WIFI_INTERFACE" up
 sleep 5
 systemctl restart networking
 sleep 5

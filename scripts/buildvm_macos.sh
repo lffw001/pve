@@ -1,12 +1,21 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/pve
-# 2025.06.09
+# 2026.08.26
 
 # ./build_macos_vm.sh VMID CPU核数 内存 硬盘 SSH端口 VNC端口 系统 存储盘 独立IPV6
 # ./build_macos_vm.sh 100 2 4096 45 44022 45901 high-sierra local N
 
 cd /root >/dev/null 2>&1
+
+validate_storage_name() {
+    local value="$1"
+    if [[ -z "$value" || ! "$value" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        echo "Invalid storage name: $value"
+        echo "存储盘名称无效：$value"
+        exit 1
+    fi
+}
 
 init_params() {
     vm_num="${1:-102}"
@@ -18,6 +27,7 @@ init_params() {
     system="${7:-big‑sur}"
     storage="${8:-local}"
     independent_ipv6="${9:-N}"
+    validate_storage_name "$storage"
     independent_ipv6=$(echo "$independent_ipv6" | tr '[:upper:]' '[:lower:]')
     rm -rf "vm$vm_num"
 }
@@ -39,13 +49,16 @@ check_cdn_file() {
     if [ "${WITHOUTCDN^^}" = "TRUE" ]; then
         export cdn_success_url=""
         echo "WITHOUTCDN=TRUE, skip CDN acceleration"
+        echo "WITHOUTCDN=TRUE，跳过 CDN 加速"
         return
     fi
     check_cdn "https://raw.githubusercontent.com/spiritLHLS/ecs/main/back/test"
     if [ -n "$cdn_success_url" ]; then
         echo "CDN available, using CDN"
+        echo "检测到可用 CDN，使用 CDN 加速"
     else
         echo "No CDN available, no use CDN"
+        echo "未检测到可用 CDN，不使用 CDN 加速"
     fi
 }
 
@@ -168,10 +181,12 @@ create_vm() {
             --name macos-${vm_num} \
             ${kvm_flag}
     else
+        local direct_ipv6_bridge
+        direct_ipv6_bridge="$(pve_direct_ipv6_bridge)" || return 1
         qm create $vm_num --agent 1 --scsihw virtio-scsi-pci \
             --cores $core --sockets 1 \
             --net0 vmxnet3,bridge=vmbr1,firewall=0 \
-            --net1 vmxnet3,bridge=vmbr2,firewall=0 \
+            --net1 vmxnet3,bridge="${direct_ipv6_bridge}",firewall=0 \
             --args "$cpu_args" \
             --machine q35 \
             --ostype other \
@@ -187,15 +202,18 @@ create_vm() {
             --name macos-${vm_num} \
             ${kvm_flag}
     fi
-    qm set $vm_num --efidisk0 ${storage}:4
+    qm set $vm_num --efidisk0 "${storage}:4"
     if [[ "$system" == "high-sierra" || "$system" == "mojave" ]]; then
-        qm set $vm_num --sata0 ${storage}:${disk},cache=none,ssd=1,discard=on
+        qm set $vm_num --sata0 "${storage}:${disk},cache=none,ssd=1,discard=on"
         if [ $? -ne 0 ]; then
             echo "Failed to mount ${storage}:${disk}. Trying alternative disk file..."
-            qm set $vm_num --sata0 ${storage}-lvm:${disk},cache=none,ssd=1,discard=on
+            echo "挂载 ${storage}:${disk} 失败，正在尝试其他磁盘文件..."
+            qm set $vm_num --sata0 "${storage}-lvm:${disk},cache=none,ssd=1,discard=on"
             if [ $? -ne 0 ]; then
                 echo "Failed to mount ${storage}-lvm:${disk}. Trying fallback file..."
+                echo "挂载 ${storage}-lvm:${disk} 失败，正在尝试回退文件..."
                 echo "All attempts to mount SATA disk failed for VM $vm_num. Exiting..."
+                echo "为 VM $vm_num 挂载 SATA 磁盘的所有尝试均失败，脚本退出..."
                 exit 1
             fi
         fi
@@ -208,13 +226,16 @@ create_vm() {
             fi
         fi
     else
-        qm set $vm_num --virtio0 ${storage}:${disk},cache=none,discard=on
+        qm set $vm_num --virtio0 "${storage}:${disk},cache=none,discard=on"
         if [ $? -ne 0 ]; then
             echo "Failed to mount ${storage}:${disk}. Trying alternative disk file..."
-            qm set $vm_num --virtio0 ${storage}-lvm:${disk},cache=none,discard=on
+            echo "挂载 ${storage}:${disk} 失败，正在尝试其他磁盘文件..."
+            qm set $vm_num --virtio0 "${storage}-lvm:${disk},cache=none,discard=on"
             if [ $? -ne 0 ]; then
                 echo "Failed to mount ${storage}-lvm:${disk}. Trying fallback file..."
+                echo "挂载 ${storage}-lvm:${disk} 失败，正在尝试回退文件..."
                 echo "All attempts to mount SATA disk failed for VM $vm_num. Exiting..."
+                echo "为 VM $vm_num 挂载磁盘的所有尝试均失败，脚本退出..."
                 exit 1
             fi
         fi
@@ -230,8 +251,8 @@ create_vm() {
     # 使用专属 opencore ISO（含独立SMBIOS）；若生成失败则回退到共享 opencore.iso
     local opencore_iso_name
     opencore_iso_name=$(basename "${MACOS_OPENCORE_ISO:-/var/lib/vz/template/iso/opencore.iso}")
-    qm set $vm_num --ide0 ${storage}:iso/${opencore_iso_name},media=cdrom,cache=unsafe
-    qm set $vm_num --ide1 ${storage}:iso/${system}.iso,media=cdrom,cache=unsafe
+    qm set $vm_num --ide0 "${storage}:iso/${opencore_iso_name},media=cdrom,cache=unsafe"
+    qm set $vm_num --ide1 "${storage}:iso/${system}.iso,media=cdrom,cache=unsafe"
     if [[ "$system" == "high-sierra" || "$system" == "mojave" ]]; then
         grep -q '^boot:' /etc/pve/qemu-server/${vm_num}.conf &&
             sed -i 's/^boot:.*/boot: order=ide0;ide1;sata0;net0/' /etc/pve/qemu-server/${vm_num}.conf ||
@@ -259,13 +280,14 @@ create_vm() {
 }
 
 configure_network() {
-    user_ip="172.16.1.${vm_num}"
+    user_ip="${pve_nat_prefix}.${vm_num}"
     if [ "$independent_ipv6" == "y" ]; then
-        if [ ! -z "$host_ipv6_address" ] && [ ! -z "$ipv6_prefixlen" ] && [ ! -z "$ipv6_gateway" ] && [ ! -z "$ipv6_address_without_last_segment" ]; then
-            if grep -q "vmbr2" /etc/network/interfaces; then
-                independent_ipv6_status="Y"
-            else
+        if [ "${pve_direct_ipv6_available:-false}" = true ]; then
+            if pve_direct_ipv6_ndp_required && [ "$(systemctl is-active ndpresponder.service 2>/dev/null || true)" != active ]; then
                 independent_ipv6_status="N"
+            else
+                vm_external_ipv6="$(pve_direct_ipv6_for_id "$vm_num")" || vm_external_ipv6=""
+                [ -n "$vm_external_ipv6" ] && independent_ipv6_status="Y" || independent_ipv6_status="N"
             fi
         else
             independent_ipv6_status="N"
@@ -277,7 +299,7 @@ configure_network() {
 }
 
 setup_port_forwarding() {
-    user_ip="172.16.1.${vm_num}"
+    user_ip="${pve_nat_prefix}.${vm_num}"
     _fw_add_dnat "vmbr0" "tcp" "${sshn}" "${user_ip}:22"
     _fw_add_dnat "vmbr0" "tcp" "${vnc_port}" "${user_ip}:5900"
     _fw_save
@@ -285,7 +307,7 @@ setup_port_forwarding() {
 
 save_vm_info() {
     if [ "$independent_ipv6_status" == "Y" ]; then
-        echo "$vm_num $core $memory $disk $sshn $vnc_port $system $storage ${ipv6_address_without_last_segment}${vm_num}" >>"vm${vm_num}"
+        echo "$vm_num $core $memory $disk $sshn $vnc_port $system $storage ${vm_external_ipv6}" >>"vm${vm_num}"
         data=$(echo " VMID CPU核数-CPU 内存-memory 硬盘-disk SSH端口 VNC端口 系统-system 存储盘-storage 独立IPV6地址-ipv6_address")
     else
         echo "$vm_num $core $memory $disk $sshn $vnc_port $system $storage" >>"vm${vm_num}"
@@ -525,6 +547,8 @@ main() {
     cdn_urls=("https://cdn0.spiritlhl.top/" "http://cdn1.spiritlhl.net/" "http://cdn2.spiritlhl.net/" "http://cdn3.spiritlhl.net/" "http://cdn4.spiritlhl.net/")
     check_cdn_file
     load_default_config || exit 1
+    load_nat_ipv4_config || exit 1
+    pve_load_direct_ipv6_config || exit 1
     setup_locale
     get_system_arch
     init_params "$@"

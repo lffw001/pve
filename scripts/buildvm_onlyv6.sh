@@ -1,22 +1,41 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/pve
-# 2025.06.10
+# 2026.08.26
 # 自动选择要绑定的IPV6地址
 # ./buildvm_onlyv6.sh VMID 用户名 密码 CPU核数 内存 硬盘 系统 存储盘
 # ./buildvm_onlyv6.sh 152 test1 1234567 1 512 5 debian11 local
 
 cd /root >/dev/null 2>&1
 
+generate_password() {
+    local value
+    value=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)
+    if [ -z "$value" ]; then
+        value="$(date +%s%N | md5sum | cut -c 3-14)"
+    fi
+    printf '%s' "$value"
+}
+
+validate_storage_name() {
+    local value="$1"
+    if [[ -z "$value" || ! "$value" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        echo "Invalid storage name: $value"
+        echo "存储盘名称无效：$value"
+        exit 1
+    fi
+}
+
 init_params() {
     vm_num="${1:-152}"
     user="${2:-test}"
-    password="${3:-123456}"
+    password="${3:-$(generate_password)}"
     core="${4:-1}"
     memory="${5:-512}"
     disk="${6:-5}"
     system="${7:-ubuntu22}"
     storage="${8:-local}"
+    validate_storage_name "$storage"
     rm -rf "vm$vm_num"
     if [ ! -d "qcow" ]; then
         mkdir qcow
@@ -25,25 +44,19 @@ init_params() {
 
 check_environment() {
     appended_file="/usr/local/bin/pve_appended_content.txt"
-    if [ ! -s "$appended_file" ]; then
-        if [ ! -f /usr/local/bin/pve_check_ipv6 ]; then
-            _yellow "No ipv6 address exists to open a server with a standalone IPV6 address"
-        fi
-        if ! grep -q "vmbr2" /etc/network/interfaces; then
-            _yellow "No vmbr2 exists to open a server with a standalone IPV6 address"
-        fi
-        service_status=$(systemctl is-active ndpresponder.service)
-        if [ "$service_status" == "active" ]; then
-            _green "The ndpresponder service started successfully and is running, and the host can open a service with a separate IPV6 address."
-            _green "ndpresponder服务启动成功且正在运行，宿主机可开设带独立IPV6地址的服务。"
-        else
-            _green "The status of the ndpresponder service is abnormal and the host may not open a service with a separate IPV6 address."
-            _green "ndpresponder服务状态异常，宿主机不可开设带独立IPV6地址的服务。"
+    if [ -s "$appended_file" ]; then
+        _green "Additional IPv6 addresses exist for mapping by NAT, and the host can open services with separate IPV6 addresses."
+        _green "存在额外的IPv6地址可供映射，宿主机可开设带独立IPV6地址的服务。"
+    elif [ "${pve_direct_ipv6_available:-false}" = true ]; then
+        if pve_direct_ipv6_ndp_required && [ "$(systemctl is-active ndpresponder.service 2>/dev/null || true)" != active ]; then
+            _red "ndpresponder is required for this IPv6 prefix but is not active"
+            _red "当前 IPv6 前缀需要 ndpresponder，但服务未运行"
             exit 1
         fi
-    elif [ -s "$appended_file" ]; then
-        _green "Additional IPv6 addresses exist for mapping by NAT, and the host can open services with separate IPV6 addresses."
-        _green "存在额外的IPv6地址可供NAT进行映射，宿主机可开设带独立IPV6地址的服务。"
+    else
+        _red "No delegated public IPv6 prefix is available for an IPv6-only VM"
+        _red "未检测到可用于纯 IPv6 虚拟机的已委派公网前缀"
+        exit 1
     fi
 }
 
@@ -64,13 +77,16 @@ check_cdn_file() {
     if [ "${WITHOUTCDN^^}" = "TRUE" ]; then
         export cdn_success_url=""
         echo "WITHOUTCDN=TRUE, skip CDN acceleration"
+        echo "WITHOUTCDN=TRUE，跳过 CDN 加速"
         return
     fi
     check_cdn "https://raw.githubusercontent.com/spiritLHLS/ecs/main/back/test"
     if [ -n "$cdn_success_url" ]; then
         echo "CDN available, using CDN"
+        echo "检测到可用 CDN，使用 CDN 加速"
     else
         echo "No CDN available, no use CDN"
+        echo "未检测到可用 CDN，不使用 CDN 加速"
     fi
 }
 
@@ -120,10 +136,10 @@ get_ipv6_info() {
 }
 
 create_vm() {
-    if [ -s "$appended_file" ]; then
+    if [ -s "$appended_file" ] || [ "${pve_direct_ipv6_available:-false}" != true ]; then
         net1_bridge="vmbr1"
     else
-        net1_bridge="vmbr2"
+        net1_bridge="$(pve_direct_ipv6_bridge)" || return 1
     fi
     qm create "$vm_num" \
         --agent 1 \
@@ -146,32 +162,40 @@ create_vm() {
 }
 
 configure_vm() {
-    volid=$(pvesm list ${storage} | awk -v vmid="${vm_num}" '$5 == vmid && $1 ~ /\.raw$/ {print $1}' | tail -n 1)
+    volid=$(pvesm list "$storage" | awk -v vmid="${vm_num}" '$5 == vmid && $1 ~ /\.raw$/ {print $1}' | tail -n 1)
     if [ -z "$volid" ]; then
         echo "No .raw file found for VM ID '${vm_num}' in storage '${storage}'. Searching for other formats..."
-        volid=$(pvesm list ${storage} | awk -v vmid="${vm_num}" '$5 == vmid {print $1}' | tail -n 1)
+        echo "在存储 '${storage}' 中未找到 VM ID '${vm_num}' 的 .raw 文件，正在尝试其他格式..."
+        volid=$(pvesm list "$storage" | awk -v vmid="${vm_num}" '$5 == vmid {print $1}' | tail -n 1)
     fi
     if [ -z "$volid" ]; then
         echo "Error: No file found for VM ID '${vm_num}' in storage '${storage}'"
+        echo "错误：在存储 '${storage}' 中未找到 VM ID '${vm_num}' 对应的磁盘文件"
         exit 1
     fi
     file_path=$(pvesm path ${volid})
     if [ $? -ne 0 ] || [ -z "$file_path" ]; then
         echo "Error: Failed to resolve path for volume '${volid}'"
+        echo "错误：无法解析卷 '${volid}' 对应的路径"
         exit 1
     fi
     file_name=$(basename "$file_path")
     echo "Found file: $file_name"
+    echo "已找到磁盘文件：$file_name"
     echo "Attempting to set SCSI hardware with virtio-scsi-pci for VM $vm_num..."
+    echo "正在尝试为 VM $vm_num 设置 virtio-scsi-pci SCSI 硬件..."
     qm set $vm_num --scsihw virtio-scsi-pci --scsi0 ${storage}:${vm_num}/vm-${vm_num}-disk-0.raw
     if [ $? -ne 0 ]; then
         echo "Failed to set SCSI hardware with vm-${vm_num}-disk-0.raw. Trying alternative disk file..."
+        echo "使用 vm-${vm_num}-disk-0.raw 设置 SCSI 硬件失败，正在尝试其他磁盘文件..."
         qm set $vm_num --scsihw virtio-scsi-pci --scsi0 ${storage}:${vm_num}/$file_name
         if [ $? -ne 0 ]; then
             echo "Failed to set SCSI hardware with $file_name for VM $vm_num. Trying fallback file..."
+            echo "使用 $file_name 为 VM $vm_num 设置 SCSI 硬件失败，正在尝试回退文件..."
             qm set $vm_num --scsihw virtio-scsi-pci --scsi0 ${storage}:$file_name
             if [ $? -ne 0 ]; then
                 echo "All attempts failed. Exiting..."
+                echo "所有尝试均失败，脚本退出..."
                 exit 1
             fi
         fi
@@ -186,12 +210,12 @@ configure_vm() {
     fi
     qm set $vm_num --nameserver "1.1.1.1 2606:4700:4700::1111" || qm set $vm_num --nameserver 1.1.1.1
     qm set $vm_num --searchdomain local
-    user_ip="172.16.1.${vm_num}"
-    qm set $vm_num --ipconfig0 ip=${user_ip}/24,gw=172.16.1.1
+    user_ip="${pve_nat_prefix}.${vm_num}"
+    qm set $vm_num --ipconfig0 ip=${user_ip}/24,gw=${pve_nat_gateway}
     appended_file="/usr/local/bin/pve_appended_content.txt"
     if [ -s "$appended_file" ]; then
-        vm_internal_ipv6="2001:db8:1::${vm_num}"
-        qm set $vm_num --ipconfig1 ip6="${vm_internal_ipv6}/64",gw6="2001:db8:1::1"
+        vm_internal_ipv6="$(pve_nat_ipv6_for_id "$vm_num")"
+        qm set $vm_num --ipconfig1 ip6="${vm_internal_ipv6}/64",gw6="${pve_nat_ipv6_gateway}"
         host_external_ipv6=$(get_available_vmbr1_ipv6)
         if [ -z "$host_external_ipv6" ]; then
             echo -e "\e[31mNo available IPv6 address found for NAT mapping\e[0m"
@@ -202,11 +226,14 @@ configure_vm() {
         vm_external_ipv6="$host_external_ipv6"
         echo "VM configured with NAT mapping: $vm_internal_ipv6 -> $host_external_ipv6"
         echo "虚拟机已配置NAT映射：$vm_internal_ipv6 -> $host_external_ipv6"
-    else
-        qm set $vm_num --ipconfig1 ip6="${ipv6_address_without_last_segment}${vm_num}/128",gw6="${host_ipv6_address}"
-        vm_external_ipv6="${ipv6_address_without_last_segment}${vm_num}"
-        _fw6_drop_icmpv6_ping "${ipv6_address_without_last_segment}${vm_num}" "${ipv6_prefixlen:+${ipv6_address_without_last_segment}/${ipv6_prefixlen}}"
+    elif [ "${pve_direct_ipv6_available:-false}" = true ]; then
+        vm_external_ipv6="$(pve_direct_ipv6_for_id "$vm_num")" || exit 1
+        qm set $vm_num --ipconfig1 ip6="${vm_external_ipv6}/128",gw6="${pve_direct_ipv6_gateway}"
+        _fw6_drop_icmpv6_ping "${vm_external_ipv6}" "${pve_direct_ipv6_prefix}"
         _fw_save
+    else
+        _red "No usable IPv6 allocation mode is available"
+        exit 1
     fi
     
     qm set $vm_num --cipassword $password --ciuser $user
@@ -247,6 +274,8 @@ main() {
     cdn_urls=("https://cdn0.spiritlhl.top/" "http://cdn1.spiritlhl.net/" "http://cdn2.spiritlhl.net/" "http://cdn3.spiritlhl.net/" "http://cdn4.spiritlhl.net/")
     check_cdn_file
     load_default_config || exit 1
+    load_nat_ipv4_config || exit 1
+    pve_load_direct_ipv6_config || exit 1
     setup_locale
     init_params "$@"
     validate_vm_num || exit 1

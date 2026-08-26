@@ -5,13 +5,38 @@
 
 ########## 预设部分输出和部分中间变量
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 cd /root >/dev/null 2>&1
-_red() { echo -e "\033[31m\033[01m$@\033[0m"; }
-_green() { echo -e "\033[32m\033[01m$@\033[0m"; }
-_yellow() { echo -e "\033[33m\033[01m$@\033[0m"; }
-_blue() { echo -e "\033[36m\033[01m$@\033[0m"; }
-reading() { read -rp "$(_green "$1")" "$2"; }
+_red() { echo -e "\033[31m\033[01m$*\033[0m"; }
+_green() { echo -e "\033[32m\033[01m$*\033[0m"; }
+_yellow() { echo -e "\033[33m\033[01m$*\033[0m"; }
+_blue() { echo -e "\033[36m\033[01m$*\033[0m"; }
+is_noninteractive() {
+    case "${noninteractive:-}" in
+    true | TRUE | True | 1 | yes | YES | Yes | y | Y)
+        return 0
+        ;;
+    esac
+    case "${NONINTERACTIVE:-}" in
+    true | TRUE | True | 1 | yes | YES | Yes | y | Y)
+        return 0
+        ;;
+    esac
+    return 1
+}
+reading() {
+    local prompt="$1"
+    local var_name="$2"
+    local default_value="${3:-}"
+    if is_noninteractive; then
+        printf -v "$var_name" '%s' "$default_value"
+        _yellow "noninteractive=true, using default for ${var_name}: ${default_value:-<empty>}"
+    else
+        read -rp "$(_green "$prompt")" "$var_name"
+    fi
+}
 export DEBIAN_FRONTEND=noninteractive
+export DOCKER_BUILDKIT=1
 utf8_locale=$(locale -a 2>/dev/null | grep -i -m 1 -E "UTF-8|utf8")
 if [[ -z "$utf8_locale" ]]; then
     echo "No UTF-8 locale found"
@@ -190,7 +215,12 @@ check_china() {
     if [[ -z "${CN}" ]]; then
         if [[ $(curl -m 6 -s https://ipapi.co/json | grep 'China') != "" ]]; then
             _yellow "根据ipapi.co提供的信息，当前IP可能在中国"
-            read -e -r -p "是否选用中国镜像完成相关组件安装? ([y]/n) " input
+            if is_noninteractive; then
+                input="${CN_DEFAULT:-y}"
+                _yellow "noninteractive=true, 使用中国镜像选择默认值: $input"
+            else
+                read -e -r -p "是否选用中国镜像完成相关组件安装? ([y]/n) " input
+            fi
             case $input in
             [yY][eE][sS] | [yY])
                 echo "使用中国镜像"
@@ -222,7 +252,14 @@ check_cdn_file
 
 if ! command -v docker >/dev/null 2>&1; then
     _yellow "Installing docker"
-    curl -sSL https://get.docker.com/ | sh
+    docker_install_script="/tmp/get-docker.sh"
+    if ! curl -fsSL https://get.docker.com/ -o "$docker_install_script"; then
+        _red "Failed to download Docker install script"
+        _red "Docker 安装脚本下载失败"
+        exit 1
+    fi
+    sh "$docker_install_script"
+    rm -f "$docker_install_script"
 fi
 if ! command -v docker-compose >/dev/null 2>&1; then
     _yellow "Installing docker-compose"
@@ -235,5 +272,18 @@ fi
 # Dockerfile_aarch64_7
 tag="x86_64_7"
 docker_file_name="Dockerfile_x86_64_7"
-curl -Lk "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/pve/main/dockerfiles/${docker_file_name}" -o /root/Dockerfile
-docker build -t "spiritlhl/proxmoxve:${tag}" -f /root/Dockerfile .
+if [ -f "${script_dir}/${docker_file_name}" ]; then
+    cp -f "${script_dir}/${docker_file_name}" /root/Dockerfile
+else
+    curl -Lk "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/pve/main/dockerfiles/${docker_file_name}" -o /root/Dockerfile
+fi
+docker_build_args=()
+if [ -n "${ROOT_PASSWORD:-}" ]; then
+    docker_build_args+=(--secret "id=root_password,env=ROOT_PASSWORD")
+elif [ -n "${PVE_DOCKER_ROOT_PASSWORD:-}" ]; then
+    export ROOT_PASSWORD="$PVE_DOCKER_ROOT_PASSWORD"
+    docker_build_args+=(--secret "id=root_password,env=ROOT_PASSWORD")
+else
+    _yellow "ROOT_PASSWORD not set; Docker image root password will be locked."
+fi
+docker build "${docker_build_args[@]}" -t "spiritlhl/proxmoxve:${tag}" -f /root/Dockerfile .
